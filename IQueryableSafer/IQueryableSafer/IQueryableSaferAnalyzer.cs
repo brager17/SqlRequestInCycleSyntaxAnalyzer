@@ -9,7 +9,13 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
-
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 namespace IQueryableSafer
 {
 
@@ -41,28 +47,64 @@ namespace IQueryableSafer
 
         public override void Initialize(AnalysisContext context)
         {
-            context.RegisterSyntaxNodeAction(NodeAction, SyntaxKind.ForStatement, SyntaxKind.ForStatement);
+            context.RegisterSyntaxNodeAction(NodeAction, SyntaxKind.ForStatement, SyntaxKind.ForStatement, SyntaxKind.InvocationExpression);
         }
 
-        private static string[] InvocationExpression = {
-            "First", "FirstOrDefault", "ToList"
-        };
+        private static string[] InvocationExpression { get; } = GetQueryableMaterializeMethodsName().ToArray();
+
 
         private void NodeAction(SyntaxNodeAnalysisContext context)
         {
             if (new[] { SyntaxKind.ForStatement, SyntaxKind.ForEachStatement }.Contains(context.Node.Kind()))
             {
                 var SqlRequestInCycle = context.Node.DescendantNodes().OfType<InvocationExpressionSyntax>()
-                    .Select(x => AnalyzeInvocationExpression(x, context.SemanticModel))
+                    .Select(x => AnalyzeInvocationExpressionInCycle(x, context.SemanticModel))
                     .Where(x => x != null)
                     .ToList();
 
                 SqlRequestInCycle.ForEach(x => context.ReportDiagnostic(Diagnostic.Create(Rule, x)));
             }
 
+            if (context.Node.Kind() == SyntaxKind.InvocationExpression)
+            {
+                var locationsIfQueryableMaterialize =
+                    AnalyzeLinqCycle(context.Node as InvocationExpressionSyntax, context.SemanticModel);
+
+                locationsIfQueryableMaterialize.Where(x => x != null).ToList()
+                    .ForEach(x => { context.ReportDiagnostic(Diagnostic.Create(Rule, x)); });
+            }
+
         }
 
-        private static Location AnalyzeInvocationExpression(InvocationExpressionSyntax ies, SemanticModel sm)
+        private static IEnumerable<Location> AnalyzeLinqCycle(InvocationExpressionSyntax ies, SemanticModel sm)
+        {
+            var childNodes = ies.ChildNodes();
+            if (childNodes.Count() != 2)
+                return null;
+
+            var left = ies.ChildNodes().First();
+            var right = ies.ChildNodes().Last();
+
+            var leftSymbol = sm.GetSymbolInfo(left);
+
+            if (leftSymbol.Symbol is IMethodSymbol methodSymbol && right is ArgumentListSyntax argumentList)
+            {
+                if (methodSymbol.ContainingType.Name != "Enumerable")
+                {
+                    return Enumerable.Empty<Location>();
+                }
+
+                var invocationsExpressionsInLinqMethod = argumentList.DescendantNodes().OfType<InvocationExpressionSyntax>();
+
+                var GetLocationIfHasQueryMaterialize =
+                    invocationsExpressionsInLinqMethod.Select(x => AnalyzeInvocationExpressionInCycle(x, sm));
+
+                return GetLocationIfHasQueryMaterialize;
+            }
+
+            return Enumerable.Empty<Location>();
+        }
+        private static Location AnalyzeInvocationExpressionInCycle(InvocationExpressionSyntax ies, SemanticModel sm)
         {
             var memberAccessExpressionSyntaxs = ies.ChildNodes().OfType<MemberAccessExpressionSyntax>();
 
@@ -80,11 +122,18 @@ namespace IQueryableSafer
                 return Exit();
             }
 
-            var rigth = partMembers.Last();
+            var right = partMembers.Last();
 
-            if (!(rigth is IdentifierNameSyntax identifier))
+            if (!(right is IdentifierNameSyntax identifier))
             {
                 return Exit();
+            }
+
+            var rightSymbol = sm.GetSymbolInfo(right);
+
+            if (!(rightSymbol.Symbol is IMethodSymbol methodSymbol))
+            {
+                return null;
             }
 
             if (!InvocationExpression.Contains(identifier.Identifier.ValueText))
@@ -92,7 +141,7 @@ namespace IQueryableSafer
                 return Exit();
             }
 
-            var linqMethodSymbol = sm.GetSymbolInfo(rigth);
+            var linqMethodSymbol = sm.GetSymbolInfo(right);
 
             var left = partMembers.First();
 
@@ -120,7 +169,78 @@ namespace IQueryableSafer
             Location Exit() => null;
 
             Location ReturnIfTypeIsIQueryable(ITypeSymbol typeInfo) =>
-                typeInfo.Name == "IQueryable" ? rigth.GetLocation() : null;
+                typeInfo.Name == "IQueryable" ? right.GetLocation() : null;
         }
+
+
+        const string programText1 =
+            @"using System;
+            using System.Collections.Generic;
+            using System.Text;
+                          using System.Linq;
+
+            namespace HelloWorld
+            {
+                class Program
+                {
+                    static void Main(string[] args)
+                    {
+                    var t = Enumerable.Range(1,100);
+                    var tt = t.AsQueryable();
+                    }
+                }
+            }";
+
+        private static IEnumerable<string> GetQueryableMaterializeMethodsName()
+        {
+            var stree = CSharpSyntaxTree.ParseText(programText1);
+            var compilationRoot = stree.GetCompilationUnitRoot();
+
+            var compilation1 = CSharpCompilation.Create("abc")
+                .AddReferences(MetadataReference.CreateFromFile(typeof(Enumerable).Assembly.Location))
+                .AddSyntaxTrees(stree);
+
+            var semanticModel = compilation1.GetSemanticModel(stree);
+
+            var descendantNodes = compilationRoot
+                .DescendantNodes();
+
+            var getEnumerable = GetIdentifierName(descendantNodes, "Enumerable");
+            var getQueryable = GetIdentifierName(descendantNodes, "AsQueryable");
+
+            var enumerableSymbol = semanticModel.GetSymbolInfo(getEnumerable);
+
+            IEnumerable<string> enumerableMethodsNames = null;
+
+            //todo дописать
+            IEnumerable<string> queryableMethodsNames = Enumerable.Empty<string>();
+            //
+            if (enumerableSymbol.Symbol is INamedTypeSymbol enumerableNamedTypeSymbol)
+            {
+                enumerableMethodsNames = GetMethods(enumerableNamedTypeSymbol)
+                    .Where(x => x.Parameters.Any() && x.Parameters.First().Type.Name == "IEnumerable")
+                    .Select(x => x.Name);
+            }
+
+            return queryableMethodsNames.Concat(enumerableMethodsNames).Distinct();
+        }
+
+
+        private static List<IMethodSymbol> GetMethods(INamedTypeSymbol namedTypeSymbol)
+        {
+            return namedTypeSymbol.GetMembers()
+                .Where(x => x.Kind == SymbolKind.Method)
+                .Cast<IMethodSymbol>()
+                .ToList();
+        }
+
+        private static IdentifierNameSyntax GetIdentifierName(IEnumerable<SyntaxNode> descendantNodes, string className)
+        {
+            var identifierNameSyntaxs = descendantNodes
+                .OfType<IdentifierNameSyntax>();
+            return identifierNameSyntaxs
+                .Single(x => x.Identifier.ValueText == className);
+        }
+
     }
 }
