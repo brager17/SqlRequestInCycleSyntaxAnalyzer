@@ -78,6 +78,8 @@ namespace IQueryableSafer
 
         private static IEnumerable<Location> AnalyzeLinqCycle(InvocationExpressionSyntax ies, SemanticModel sm)
         {
+            new[] { 1, 2 }.AsQueryable();
+
             var childNodes = ies.ChildNodes();
             if (childNodes.Count() != 2)
                 return null;
@@ -186,7 +188,7 @@ namespace IQueryableSafer
                     static void Main(string[] args)
                     {
                     var t = Enumerable.Range(1,100);
-                    var tt = t.AsQueryable();
+                    var tt = Queryable.AsQueryable();
                     }
                 }
             }";
@@ -196,8 +198,10 @@ namespace IQueryableSafer
             var stree = CSharpSyntaxTree.ParseText(programText1);
             var compilationRoot = stree.GetCompilationUnitRoot();
 
+            // <Snippet2>
             var compilation1 = CSharpCompilation.Create("abc")
                 .AddReferences(MetadataReference.CreateFromFile(typeof(Enumerable).Assembly.Location))
+                .AddReferences(MetadataReference.CreateFromFile(typeof(Queryable).Assembly.Location))
                 .AddSyntaxTrees(stree);
 
             var semanticModel = compilation1.GetSemanticModel(stree);
@@ -205,24 +209,24 @@ namespace IQueryableSafer
             var descendantNodes = compilationRoot
                 .DescendantNodes();
 
-            var getEnumerable = GetIdentifierName(descendantNodes, "Enumerable");
-            var getQueryable = GetIdentifierName(descendantNodes, "AsQueryable");
+            var getQueryable = GetIdentifierName(descendantNodes, "Queryable");
 
-            var enumerableSymbol = semanticModel.GetSymbolInfo(getEnumerable);
+            var queryableSymbo = semanticModel.GetSymbolInfo(getQueryable);
 
-            IEnumerable<string> enumerableMethodsNames = null;
-
+            IEnumerable<string> queryableSymbol = null;
             //todo дописать
-            IEnumerable<string> queryableMethodsNames = Enumerable.Empty<string>();
+            var queryableMethodsNames = Enumerable.Empty<string>();
             //
-            if (enumerableSymbol.Symbol is INamedTypeSymbol enumerableNamedTypeSymbol)
+            if (queryableSymbo.Symbol is INamedTypeSymbol enumerableNamedTypeSymbol)
             {
-                enumerableMethodsNames = GetMethods(enumerableNamedTypeSymbol)
-                    .Where(x => x.Parameters.Any() && x.Parameters.First().Type.Name == "IEnumerable")
-                    .Select(x => x.Name);
+                queryableSymbol = GetMethods(enumerableNamedTypeSymbol)
+                    .Where(x => x.Parameters.Any() && x.Parameters.First().Type.Name == "IQueryable" &&
+                                x.ReturnType.Name != "IQueryable" && x.ReturnType.Name != "IOrderedQueryable")
+                    .Select(x => x.Name)
+                    .Distinct();
             }
 
-            return queryableMethodsNames.Concat(enumerableMethodsNames).Distinct();
+            return queryableSymbol.Concat(new[] { "ToList" });
         }
 
 
